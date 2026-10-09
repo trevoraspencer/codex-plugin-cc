@@ -240,7 +240,7 @@ function taskPayload(prompt, resume) {
     return "BLOCK: Missing empty-state guard in src/app.js:4-6.";
   }
 
-  if (resume || prompt.includes("Continue from the current thread state") || prompt.includes("follow up")) {
+  if (resume || prompt.includes("Continue the task from this thread's earlier turns") || prompt.includes("follow up")) {
     return "Resumed the prior run.\\nFollow-up prompt accepted.";
   }
 
@@ -313,7 +313,14 @@ rl.on("line", (line) => {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        state.lastThreadStart = {
+          model: message.params.model ?? null,
+          sandbox: message.params.sandbox ?? null,
+          config: message.params.config ?? null,
+          developerInstructions: message.params.developerInstructions ?? null
+        };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6.1-sol", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
       }
@@ -346,8 +353,13 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = {
+          model: message.params.model ?? null,
+          sandbox: message.params.sandbox ?? null,
+          developerInstructions: message.params.developerInstructions ?? null
+        };
         saveState(state);
-        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
+        send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-6.1-sol", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
 
@@ -456,7 +468,7 @@ rl.on("line", (line) => {
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)
-          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue from the current thread state"));
+          : taskPayload(prompt, thread.name && thread.name.startsWith("Codex Companion Task") && prompt.includes("Continue the task from this thread's earlier turns"));
 
         if (
           BEHAVIOR === "with-subagent" ||
@@ -651,8 +663,11 @@ rl.on("line", (line) => {
 
 export function buildEnv(binDir) {
   const sep = process.platform === "win32" ? ";" : ":";
-  return {
+  const env = {
     ...process.env,
     PATH: `${binDir}${sep}${process.env.PATH}`
   };
+  // Keep model-default tests independent of the caller's shell.
+  delete env.CODEX_COMPANION_MODEL_DEFAULTS;
+  return env;
 }

@@ -47,7 +47,23 @@ import { binaryAvailable } from "./process.mjs";
 const SERVICE_NAME = "claude_code_codex_plugin";
 const TASK_THREAD_PREFIX = "Codex Companion Task";
 const DEFAULT_CONTINUE_PROMPT =
-  "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
+  "Continue the task from this thread's earlier turns. Complete anything left unfinished or unchecked, including checks you had planned. If nothing is left, say so in one sentence. Do not start unrelated work.";
+
+// Sent as developer instructions on every thread the plugin starts or resumes.
+// Plugin runs have no interactive user, and git history belongs to the caller.
+const RUN_INSTRUCTIONS = [
+  "This run was started by a Claude Code plugin, so nobody can answer questions or approve actions while it runs.",
+  "Do not ask questions, wait for approval, or leave a question pending. Where you would normally ask, take the most reasonable low-risk reading and continue. Note the assumption in your final answer, inside whatever output format the task requires and never before a required first line.",
+  "If the sandbox blocks an action, do not work around it: finish everything else and report what was blocked.",
+  "Git history belongs to the caller: do not create or switch branches, worktrees, commits, stashes, or pull requests, even where you would normally use them to make progress.",
+  "The run is complete when the requested work is done and checked. Give the final answer then, and do not start follow-up or monitoring work."
+].join(" ");
+const READ_ONLY_INSTRUCTIONS =
+  "This run is read-only. Inspect the workspace and run commands that only read it; do not modify project files. If a change would help, describe it in your answer.";
+const WRITE_INSTRUCTIONS =
+  "Make the changes the task needs, creating or editing files as required, and keep them within the task's scope. Run tests, builds, and formatters as usual, but format only files you changed. The working tree may hold uncommitted changes you did not make. Leave them intact, and do not run commands that discard or rewrite work (reset, restore, checkout --, clean, stash, rebase).";
+const RESUMED_RUN_PREFIX =
+  "These run instructions replace the plugin run instructions from earlier turns. The task and its requirements from earlier turns still apply.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
 
@@ -59,13 +75,25 @@ function cleanCodexStderr(stderr) {
     .join("\n");
 }
 
+export function buildDeveloperInstructions(sandbox, options = {}) {
+  const writable = Boolean(sandbox) && sandbox !== "read-only";
+  const parts = [RUN_INSTRUCTIONS, writable ? WRITE_INSTRUCTIONS : READ_ONLY_INSTRUCTIONS];
+  if (options.resumed) {
+    parts.unshift(RESUMED_RUN_PREFIX);
+  }
+  return parts.join("\n\n");
+}
+
 /** @returns {ThreadStartParams} */
 function buildThreadParams(cwd, options = {}) {
+  const sandbox = options.sandbox ?? "read-only";
   return {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only",
+    sandbox,
+    config: options.configOverrides ?? null,
+    developerInstructions: buildDeveloperInstructions(sandbox),
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
   };
@@ -73,12 +101,14 @@ function buildThreadParams(cwd, options = {}) {
 
 /** @returns {ThreadResumeParams} */
 function buildResumeParams(threadId, cwd, options = {}) {
+  const sandbox = options.sandbox ?? "read-only";
   return {
     threadId,
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
-    sandbox: options.sandbox ?? "read-only"
+    sandbox,
+    developerInstructions: buildDeveloperInstructions(sandbox, { resumed: true })
   };
 }
 
@@ -1007,8 +1037,16 @@ export async function runAppServerReview(cwd, options = {}) {
 
   return withAppServer(cwd, async (client) => {
     emitProgress(options.onProgress, "Starting Codex review thread.", "starting");
+    // review/start takes no model or effort parameters, so set them on the
+    // review thread. review_model keeps a configured review model from
+    // replacing the one the plugin selected.
+    const configOverrides = {
+      ...(options.model ? { review_model: options.model } : {}),
+      ...(options.effort ? { model_reasoning_effort: options.effort } : {})
+    };
     const thread = await startThread(client, cwd, {
       model: options.model,
+      configOverrides: Object.keys(configOverrides).length ? configOverrides : null,
       sandbox: "read-only",
       ephemeral: true,
       threadName: options.threadName

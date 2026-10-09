@@ -5,7 +5,7 @@ Use Codex from inside Claude Code for code reviews or to delegate tasks to Codex
 This plugin is for Claude Code users who want an easy way to start using Codex from the workflow
 they already have.
 
-<video src="./docs/plugin-demo.webm" controls muted playsinline autoplay></video>
+This repository is an independently maintained fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc). It is not affiliated with or endorsed by OpenAI.
 
 ## What You Get
 
@@ -15,23 +15,27 @@ they already have.
 
 ## Requirements
 
-- **ChatGPT subscription (incl. Free) or OpenAI API key.**
+- **ChatGPT subscription or OpenAI API key.**
   - Usage will contribute to your Codex usage limits. [Learn more](https://developers.openai.com/codex/pricing).
-- **Node.js 18.18 or later**
+  - The default models (`gpt-6.1-sol` and `gpt-6-astra`) need a paid ChatGPT plan or API access. See [Models and reasoning effort](#models-and-reasoning-effort) to use other models.
+- **Node.js 22 or later**
+- **Codex CLI.** `/codex:setup` can install it for you.
 
 ## Install
 
 Add the marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add openai/codex-plugin-cc
+/plugin marketplace add trevoraspencer/codex-plugin-cc
 ```
 
 Install the plugin:
 
 ```bash
-/plugin install codex@openai-codex
+/plugin install codex@trevoraspencer
 ```
+
+This fork uses the same `codex` plugin name and `/codex:*` commands as the upstream plugin. If you have the upstream plugin installed, uninstall it first.
 
 Reload plugins:
 
@@ -86,7 +90,7 @@ Use it when you want:
 - a review of your current uncommitted changes
 - a review of your branch compared to a base branch like `main`
 
-Use `--base <ref>` for branch review. It also supports `--wait` and `--background`. It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
+Use `--base <ref>` for branch review. It also supports `--wait`, `--background`, `--model`, and `--effort` (see [Models and reasoning effort](#models-and-reasoning-effort)). It is not steerable and does not take custom focus text. Use [`/codex:adversarial-review`](#codexadversarial-review) when you want to challenge a specific decision or risk area.
 
 Examples:
 
@@ -105,7 +109,7 @@ Runs a **steerable** review that questions the chosen implementation and design.
 It can be used to pressure-test assumptions, tradeoffs, failure modes, and whether a different approach would have been safer or simpler.
 
 It uses the same review target selection as `/codex:review`, including `--base <ref>` for branch review.
-It also supports `--wait` and `--background`. Unlike `/codex:review`, it can take extra focus text after the flags.
+It also supports `--wait`, `--background`, `--model`, and `--effort`. Unlike `/codex:review`, it can take extra focus text after the flags.
 
 Use it when you want:
 
@@ -145,8 +149,8 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
-/codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
-/codex:rescue --model spark fix the issue quickly
+/codex:rescue --model luna --effort high investigate the flaky integration test
+/codex:rescue --model astra --effort max find the root cause of the data race
 /codex:rescue --background investigate the regression
 ```
 
@@ -158,8 +162,8 @@ Ask Codex to redesign the database connection to be more resilient.
 
 **Notes:**
 
-- if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
-- if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
+- new tasks use `gpt-6.1-sol` at `xhigh` unless you pass `--model` or `--effort`. See [Models and reasoning effort](#models-and-reasoning-effort).
+- resumed tasks keep the model and effort of the thread they continue unless you pass new ones
 - follow-up rescue requests can continue the latest Codex task in the repo
 
 ### `/codex:transfer`
@@ -266,16 +270,36 @@ Then check in with:
 
 ## Codex Integration
 
-The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic).
+The Codex plugin wraps the [Codex app server](https://developers.openai.com/codex/app-server). It uses the global `codex` binary installed in your environment and [applies the same configuration](https://developers.openai.com/codex/config-basic), with the exceptions described below.
+
+### Models and reasoning effort
+
+Each command picks its own model and reasoning effort:
+
+| Command | Default model | Default effort |
+| --- | --- | --- |
+| `/codex:review` | `gpt-6-astra` | `xhigh` |
+| `/codex:adversarial-review` | `gpt-6-astra` | `xhigh` |
+| `/codex:rescue` | `gpt-6.1-sol` | `xhigh` |
+
+- `--model` accepts a full model id or one of the aliases `sol` (`gpt-6.1-sol`), `astra` (`gpt-6-astra`), and `luna` (`gpt-6-luna`).
+- `--effort` accepts `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`. Not every model supports every level; for example, `gpt-6-luna` does not support `ultra`. `ultra` lets Codex split work across subagents and can use much more of your plan.
+- `--model` and `--effort` each replace one default, so `--model luna` still runs at the command's default effort.
+- The optional stop-time review gate uses the `/codex:rescue` defaults.
+- Resumed `/codex:rescue` tasks keep their thread's model and effort unless you pass new ones.
+- For new runs, the plugin's defaults take precedence over the `model` and `model_reasoning_effort` keys in your `config.toml`.
+
+To use your Codex configuration instead of these defaults, for example with a different model provider or a plan without access to these models, set `CODEX_COMPANION_MODEL_DEFAULTS=off` in the environment Claude Code runs in. Flags you pass still apply.
+
+### Run rules
+
+Every thread the plugin starts or resumes tells Codex, through developer instructions, that no one can answer questions while it runs, so it should state its assumptions instead of asking. Codex is also told not to create or switch branches, worktrees, commits, stashes, or pull requests. Write-capable runs are told to leave uncommitted changes they did not make intact.
+
+The plugin also sets the sandbox and approval policy for each run: reviews are read-only, and `/codex:rescue` runs are write-capable unless you ask for read-only work.
 
 ### Common Configurations
 
-If you want to change the default reasoning effort or the default model that gets used by the plugin, you can define that inside your user-level or project-level `config.toml`. For example to always use `gpt-5.4-mini` on `high` for a specific project you can add the following to a `.codex/config.toml` file at the root of the directory you started Claude in:
-
-```toml
-model = "gpt-5.4-mini"
-model_reasoning_effort = "high"
-```
+Other settings, such as your sign-in, model provider, and MCP servers, come from your Codex configuration.
 
 Your configuration will be picked up based on:
 
@@ -311,7 +335,7 @@ That means:
 
 ### Will it use the same Codex config I already have?
 
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
+Mostly. The plugin uses your sign-in, provider, and other [configuration](#common-configurations), but it sets the model, reasoning effort, sandbox, and approval policy for each run. See [Models and reasoning effort](#models-and-reasoning-effort) for how to turn the model defaults off.
 
 ### Can I keep using my current API key or base URL setup?
 
