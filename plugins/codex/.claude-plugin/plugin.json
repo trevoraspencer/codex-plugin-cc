@@ -1,8 +1,11 @@
 {
   "name": "codex",
-  "version": "1.0.6",
+  "version": "2.0.0",
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
-    "name": "OpenAI"
-  }
+    "name": "Trevor Spencer"
+  },
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/trevoraspencer/codex-plugin-cc",
+  "repository": "https://github.com/trevoraspencer/codex-plugin-cc"
 }
