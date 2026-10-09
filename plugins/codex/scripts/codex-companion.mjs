@@ -78,10 +78,10 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <level>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <level>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <level>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-job <job-id>|--fresh] [--model <model>] [--effort <level>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--wait [--timeout-ms <ms>]] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
       "",
       "Models: a full model id, or the aliases sol, astra, luna.",
@@ -308,6 +308,23 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
+function resolveTaskThreadForJob(cwd, reference, options = {}) {
+  const { workspaceRoot, job } = buildSingleJobSnapshot(cwd, reference);
+  if (job.jobClass !== "task" || !job.threadId) {
+    throw new Error(`Job ${job.id} has no Codex task thread to continue.`);
+  }
+  const busy = listJobs(workspaceRoot).find(
+    (candidate) =>
+      candidate.id !== options.excludeJobId &&
+      candidate.threadId === job.threadId &&
+      isActiveJobStatus(candidate.status)
+  );
+  if (busy) {
+    throw new Error(`Job ${busy.id} is still running on that Codex thread. Wait for it to finish before following up.`);
+  }
+  return { id: job.threadId };
+}
+
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
@@ -441,11 +458,15 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: Boolean(request.resumeLast || request.resumeJobId)
   });
 
   let resumeThreadId = null;
-  if (request.resumeLast) {
+  if (request.resumeJobId) {
+    resumeThreadId = resolveTaskThreadForJob(request.cwd, request.resumeJobId, {
+      excludeJobId: request.jobId
+    }).id;
+  } else if (request.resumeLast) {
     const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
       excludeJobId: request.jobId
     });
@@ -578,7 +599,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeJobId, jobId }) {
   return {
     cwd,
     model,
@@ -586,6 +607,7 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
+    resumeJobId,
     jobId
   };
 }
@@ -743,7 +765,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "resume-job"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -753,25 +775,37 @@ async function handleTask(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeJobId = options["resume-job"] == null ? null : String(options["resume-job"]).trim();
+  if (resumeJobId === "") {
+    throw new Error("--resume-job requires a job id.");
+  }
   const fresh = Boolean(options.fresh);
   if (resumeLast && fresh) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
+  if (resumeJobId && (resumeLast || fresh)) {
+    throw new Error("Choose only one of --resume-job, --resume/--resume-last, and --fresh.");
+  }
+  const resuming = resumeLast || Boolean(resumeJobId);
   // A resumed thread keeps the model and effort it already has unless the
   // caller asks for a change; new threads get the task defaults.
-  const { model, effort } = resumeLast
+  const { model, effort } = resuming
     ? resolveModelSelection(null, { model: options.model, effort: options.effort })
     : resolveModelSelection("task", { model: options.model, effort: options.effort });
+  if (resumeJobId) {
+    // Fail before queuing a job if the named job cannot be continued.
+    resolveTaskThreadForJob(cwd, resumeJobId);
+  }
   const prompt = readTaskPrompt(cwd, options, positionals);
   const write = Boolean(options.write);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resuming
   });
 
   if (options.background) {
     ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    requireTaskRequest(prompt, resuming);
 
     const job = buildTaskJob(workspaceRoot, taskMetadata, write);
     const request = buildTaskRequest({
@@ -781,6 +815,7 @@ async function handleTask(argv) {
       prompt,
       write,
       resumeLast,
+      resumeJobId,
       jobId: job.id
     });
     const { payload } = enqueueBackgroundTask(cwd, job, request);
@@ -799,6 +834,7 @@ async function handleTask(argv) {
         prompt,
         write,
         resumeLast,
+        resumeJobId,
         jobId: job.id,
         onProgress: progress
       }),
@@ -891,14 +927,39 @@ async function handleStatus(argv) {
   outputResult(renderStatusPayload(report, options.json), options.json);
 }
 
-function handleResult(argv) {
+function renderResultWaitTimeout(job, timeoutMs) {
+  const phase = job.phase && job.phase !== job.status ? ` (${job.phase})` : "";
+  const seconds = Math.round(timeoutMs / 1000);
+  return `Job ${job.id} is still ${job.status}${phase} after waiting ${seconds}s. Run the same command again to keep waiting.\n`;
+}
+
+async function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json", "wait"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
+  if (options.wait) {
+    if (!reference) {
+      throw new Error("`result --wait` requires a job id.");
+    }
+    const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
+      timeoutMs: options["timeout-ms"],
+      pollIntervalMs: options["poll-interval-ms"]
+    });
+    if (snapshot.waitTimedOut) {
+      const payload = {
+        job: snapshot.job,
+        waitTimedOut: true,
+        timeoutMs: snapshot.timeoutMs
+      };
+      outputCommandResult(payload, renderResultWaitTimeout(snapshot.job, snapshot.timeoutMs), options.json);
+      return;
+    }
+  }
+
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
   const payload = {
@@ -906,7 +967,13 @@ function handleResult(argv) {
     storedJob
   };
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  let rendered = renderStoredJobResult(job, storedJob);
+  if (options.wait && job.status !== "completed") {
+    // Callers that wait on a job need an unambiguous outcome line, because a
+    // failed job's stored output does not always state its status.
+    rendered += `\nJob ${job.id} ${job.status === "cancelled" ? "was cancelled" : "failed"}.\n`;
+  }
+  outputCommandResult(payload, rendered, options.json);
 }
 
 function handleTaskResumeCandidate(argv) {
@@ -1037,7 +1104,7 @@ async function main() {
       await handleStatus(argv);
       break;
     case "result":
-      handleResult(argv);
+      await handleResult(argv);
       break;
     case "task-resume-candidate":
       handleTaskResumeCandidate(argv);

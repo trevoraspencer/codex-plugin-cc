@@ -36,5 +36,14 @@ export function readStdinIfPiped() {
   if (process.stdin.isTTY) {
     return "";
   }
-  return fs.readFileSync(0, "utf8");
+  try {
+    return fs.readFileSync(0, "utf8");
+  } catch (error) {
+    // Some callers, including Claude Code's Bash tool, pass a non-blocking
+    // stdin with nothing written to it. Treat that as no input.
+    if (error?.code === "EAGAIN") {
+      return "";
+    }
+    throw error;
+  }
 }

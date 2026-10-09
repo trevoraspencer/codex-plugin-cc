@@ -14,6 +14,14 @@ First release of this fork of [openai/codex-plugin-cc](https://github.com/openai
 - Threads started or resumed by the plugin receive developer instructions: runs are non-interactive, Codex is told not to create or switch branches, worktrees, commits, stashes, or pull requests, and write-capable runs are told to leave uncommitted changes they did not make intact.
 - The resume prompt finishes the earlier task without starting unrelated work.
 - The adversarial review prompt treats repository content as material under review rather than instructions.
+- Replaced the `codex:codex-rescue` subagent and its helper skills with a `codex:delegate` skill. Claude now runs the companion itself, so errors such as an unsupported model reach the user instead of being dropped by the forwarding subagent.
+- Claude can consult Codex on its own for design challenges, diagnoses, fresh attempts when it is stuck, and second-opinion reviews. Runs it starts are read-only unless it asks Codex to make a change, and it waits for any run that can edit files. The README includes rules you can add to `CLAUDE.md`.
+- `/codex:rescue` turns the request into a structured Codex prompt that ends with the original wording, waits for the result by default, and runs read-only with `--background`. Claude no longer invokes `/codex:rescue` or `/codex:setup` on its own.
+- Replaced the GPT-5.4 prompting guidance with guidance for GPT-6 models.
+- Delegated prompts are passed through a quoted heredoc, so the shell no longer expands backticks or `$(...)` in a request.
+- `result` accepts `--wait` and `--timeout-ms` to wait for a running job to finish.
+- `task` accepts `--resume-job <job-id>` to continue the Codex thread of a specific earlier run, so a follow-up reaches the right thread when several runs have finished.
+- Reading a prompt from stdin no longer fails when the caller's stdin is non-blocking and empty, as in Claude Code's Bash tool.
 - Requires Node.js 22 or later.
 
 Versions 1.0.0 through 1.0.6 were released upstream; only 1.0.0 has an entry here.

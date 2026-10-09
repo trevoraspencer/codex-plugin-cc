@@ -354,6 +354,7 @@ rl.on("line", (line) => {
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
         state.lastThreadResume = {
+          threadId: message.params.threadId ?? null,
           model: message.params.model ?? null,
           sandbox: message.params.sandbox ?? null,
           developerInstructions: message.params.developerInstructions ?? null

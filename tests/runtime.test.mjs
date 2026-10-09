@@ -1219,6 +1219,153 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   assert.match(resultPayload.storedJob.rendered, /Handled the requested task/);
 });
 
+test("result --wait returns a background task's output, and the prompt can come from stdin", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir, "slow-task");
+  const prompt = "# Goal\nExplain why `value` breaks when $(items) is empty.\n";
+
+  const launched = run("node", [SCRIPT, "task", "--background"], {
+    cwd: repo,
+    env: buildEnv(binDir),
+    input: prompt
+  });
+
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = launched.stdout.match(/\b(task-[\w-]+)/)?.[1];
+  assert.ok(jobId, launched.stdout);
+
+  const waited = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "15000"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.match(waited.stdout, /Handled the requested task/);
+  assert.equal(readFakeState(binDir).lastTurnStart.prompt, prompt.trimEnd());
+});
+
+test("result --wait reports a job that is still running and can be run again", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir, "interruptible-slow-task");
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the slow path"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const early = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "300"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(early.status, 0, early.stderr);
+  assert.match(early.stdout, new RegExp(`^Job ${jobId} is still (queued|running)`));
+  assert.match(early.stdout, /Run the same command again to keep waiting\./);
+
+  const finished = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "20000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(finished.status, 0, finished.stderr);
+  const payload = JSON.parse(finished.stdout);
+  assert.equal(payload.job.id, jobId);
+  assert.equal(payload.job.status, "completed");
+});
+
+test("result --wait ends with an explicit line when the job failed", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir, "auth-run-fails");
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the failing test"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const waited = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "15000"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.match(waited.stdout, /authentication expired; run codex login/);
+  assert.match(waited.stdout, new RegExp(`\\nJob ${jobId} failed\\.\\n$`));
+});
+
+function launchAndFinishTask(repo, binDir, prompt) {
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", prompt], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const finished = run("node", [SCRIPT, "result", jobId, "--wait", "--timeout-ms", "15000", "--json"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(finished.status, 0, finished.stderr);
+  const payload = JSON.parse(finished.stdout);
+  assert.equal(payload.job.status, "completed");
+  return { jobId, threadId: payload.storedJob.threadId };
+}
+
+test("task --resume-job continues the named job's thread even after a later task", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const first = launchAndFinishTask(repo, binDir, "challenge the cache design");
+  const second = launchAndFinishTask(repo, binDir, "review the retry change");
+  assert.notEqual(first.threadId, second.threadId);
+
+  const followUp = run("node", [SCRIPT, "task", "--resume-job", first.jobId, "--write", "apply the fix you proposed"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(followUp.status, 0, followUp.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastThreadResume.threadId, first.threadId);
+  assert.equal(fakeState.lastThreadResume.model, null);
+  assert.equal(fakeState.lastThreadResume.sandbox, "workspace-write");
+  assert.equal(fakeState.lastTurnStart.prompt, "apply the fix you proposed");
+});
+
+test("task --resume-job rejects other thread flags and jobs it cannot continue", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+  const { jobId } = launchAndFinishTask(repo, binDir, "diagnose the failure");
+
+  const conflicting = run("node", [SCRIPT, "task", "--resume-job", jobId, "--fresh", "go on"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(conflicting.status, 1);
+  assert.match(conflicting.stderr, /Choose only one of --resume-job, --resume\/--resume-last, and --fresh\./);
+
+  const empty = run("node", [SCRIPT, "task", "--resume-job", " ", "--write", "apply the fix you proposed"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(empty.status, 1);
+  assert.match(empty.stderr, /--resume-job requires a job id\./);
+
+  const unknown = run("node", [SCRIPT, "task", "--background", "--resume-job", "task-missing", "go on"], {
+    cwd: repo,
+    env: buildEnv(binDir)
+  });
+  assert.equal(unknown.status, 1);
+  assert.match(unknown.stderr, /No job found for "task-missing"/);
+});
+
+test("result --wait requires a job id", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "result", "--wait"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /`result --wait` requires a job id\./);
+});
+
 test("review rejects focus text because it is native-review only", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
