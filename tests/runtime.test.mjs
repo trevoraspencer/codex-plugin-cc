@@ -773,15 +773,265 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "task", "--model", "spark", "--effort", "low", "diagnose the failing test"], {
+  const result = run("node", [SCRIPT, "task", "--model", "luna", "--effort", "low", "diagnose the failing test"], {
     cwd: repo,
     env: buildEnv(binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
-  assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-luna");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+});
+
+function setupCommittedRepo(binDir, behavior) {
+  const repo = makeTempDir();
+  installFakeCodex(binDir, behavior);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "src"));
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0];\n");
+  run("git", ["add", "src/app.js"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  fs.writeFileSync(path.join(repo, "src", "app.js"), "export const value = items[0].id;\n");
+  return repo;
+}
+
+function readFakeState(binDir) {
+  return JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+}
+
+function fakeStateIfPresent(binDir) {
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  return fs.existsSync(statePath) ? readFakeState(binDir) : {};
+}
+
+test("task uses the default model and effort when none are requested", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "task", "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6.1-sol");
+  assert.equal(fakeState.lastTurnStart.effort, "xhigh");
+});
+
+test("task keeps the default effort when only the model is overridden", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--model", "astra", "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-astra");
+  assert.equal(fakeState.lastTurnStart.effort, "xhigh");
+});
+
+test("CODEX_COMPANION_MODEL_DEFAULTS=off leaves unset values to the Codex configuration", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_MODEL_DEFAULTS: "off" };
+
+  const task = run("node", [SCRIPT, "task", "diagnose the failing test"], { cwd: repo, env });
+  assert.equal(task.status, 0, task.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+  assert.equal(readFakeState(binDir).lastTurnStart.effort, null);
+
+  const flagged = run("node", [SCRIPT, "task", "--effort", "high", "diagnose the failing test"], { cwd: repo, env });
+  assert.equal(flagged.status, 0, flagged.stderr);
+  assert.equal(readFakeState(binDir).lastTurnStart.model, null);
+  assert.equal(readFakeState(binDir).lastTurnStart.effort, "high");
+
+  const review = run("node", [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  assert.equal(readFakeState(binDir).lastThreadStart.model, null);
+  assert.equal(readFakeState(binDir).lastThreadStart.config, null);
+});
+
+test("task accepts max and ultra reasoning effort", () => {
+  for (const effort of ["max", "ultra"]) {
+    const binDir = makeTempDir();
+    const repo = setupCommittedRepo(binDir);
+
+    const result = run("node", [SCRIPT, "task", "--effort", effort, "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+
+    assert.equal(result.status, 0, `effort ${effort}: ${result.stderr}`);
+    assert.equal(readFakeState(binDir).lastTurnStart.effort, effort, `effort ${effort}`);
+  }
+});
+
+test("task rejects reasoning efforts that current models do not support", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--effort", "minimal", "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Unsupported reasoning effort "minimal"\. Use one of: low, medium, high, xhigh, max, ultra\./);
+});
+
+test("task explains that the spark alias has been retired", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "task", "--model", "spark", "fix it quickly"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /`spark` alias pointed to gpt-5\.3-codex-spark/);
+  assert.match(result.stderr, /--model luna/);
+});
+
+test("review commands reject the spark alias and unsupported efforts before starting Codex", () => {
+  const cases = [
+    ["review", ["--model", "spark"], /spark/],
+    ["adversarial-review", ["--model", "spark"], /spark/],
+    ["review", ["--effort", "none"], /Unsupported reasoning effort "none"/],
+    ["adversarial-review", ["--effort", "minimal"], /Unsupported reasoning effort "minimal"/]
+  ];
+  for (const [command, args, pattern] of cases) {
+    const binDir = makeTempDir();
+    const repo = setupCommittedRepo(binDir);
+
+    const result = run("node", [SCRIPT, command, ...args], { cwd: repo, env: buildEnv(binDir) });
+
+    assert.notEqual(result.status, 0, `${command} ${args.join(" ")}`);
+    assert.match(result.stderr, pattern);
+    assert.ok(!fakeStateIfPresent(binDir).lastThreadStart, `${command} ${args.join(" ")} should not start a thread`);
+  }
+});
+
+test("task threads receive non-interactive developer instructions scoped to the sandbox", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const readOnly = run("node", [SCRIPT, "task", "diagnose the failing test"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(readOnly.status, 0, readOnly.stderr);
+  let thread = readFakeState(binDir).lastThreadStart;
+  assert.equal(thread.sandbox, "read-only");
+  assert.match(thread.developerInstructions, /nobody can answer questions or approve actions while it runs/);
+  assert.match(thread.developerInstructions, /never before a required first line/);
+  assert.match(thread.developerInstructions, /do not create or switch branches, worktrees, commits, stashes, or pull requests/);
+  assert.match(thread.developerInstructions, /This run is read-only/);
+  assert.doesNotMatch(thread.developerInstructions, /replace the plugin run instructions/);
+
+  const write = run("node", [SCRIPT, "task", "--write", "fix the failing test"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(write.status, 0, write.stderr);
+  thread = readFakeState(binDir).lastThreadStart;
+  assert.equal(thread.sandbox, "workspace-write");
+  assert.match(thread.developerInstructions, /uncommitted changes you did not make\. Leave them intact/);
+  assert.doesNotMatch(thread.developerInstructions, /This run is read-only/);
+});
+
+test("task --resume-last keeps the thread's model unless a new one is requested", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const first = run("node", [SCRIPT, "task", "--model", "luna", "investigate the failure"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(first.status, 0, first.stderr);
+
+  const resumed = run("node", [SCRIPT, "task", "--resume-last", "follow up"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(resumed.status, 0, resumed.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastThreadResume.model, null);
+  assert.equal(fakeState.lastTurnStart.model, null);
+  assert.equal(fakeState.lastTurnStart.effort, null);
+  assert.match(fakeState.lastThreadResume.developerInstructions, /^These run instructions replace the plugin run instructions from earlier turns\. The task and its requirements from earlier turns still apply\./);
+  assert.match(fakeState.lastThreadResume.developerInstructions, /This run is read-only/);
+});
+
+test("task --resume-last with no prompt sends the default continue prompt and honors explicit flags", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+  assert.equal(run("node", [SCRIPT, "task", "first"], { cwd: repo, env: buildEnv(binDir) }).status, 0);
+
+  const result = run("node", [SCRIPT, "task", "--resume-last", "--model", "luna", "--write"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout, "Resumed the prior run.\nFollow-up prompt accepted.\n");
+  const fakeState = readFakeState(binDir);
+  assert.match(fakeState.lastTurnStart.prompt, /^Continue the task from this thread's earlier turns\./);
+  assert.equal(fakeState.lastThreadResume.model, "gpt-6-luna");
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-luna");
+  assert.equal(fakeState.lastTurnStart.effort, null);
+  assert.equal(fakeState.lastThreadResume.sandbox, "workspace-write");
+  assert.match(fakeState.lastThreadResume.developerInstructions, /Leave them intact/);
+});
+
+test("background task carries the resolved model and effort into the worker", () => {
+  const scenarios = [
+    [["--model", "astra", "--effort", "max"], "gpt-6-astra", "max"],
+    [[], "gpt-6.1-sol", "xhigh"]
+  ];
+  for (const [flags, expectedModel, expectedEffort] of scenarios) {
+    const binDir = makeTempDir();
+    const repo = setupCommittedRepo(binDir);
+
+    const launch = run("node", [SCRIPT, "task", "--background", "--json", ...flags, "investigate"], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(launch.status, 0, launch.stderr);
+    const jobId = JSON.parse(launch.stdout).jobId;
+
+    const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env: buildEnv(binDir) });
+    assert.equal(waited.status, 0, waited.stderr);
+    assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+    const fakeState = readFakeState(binDir);
+    assert.equal(fakeState.lastTurnStart.model, expectedModel);
+    assert.equal(fakeState.lastTurnStart.effort, expectedEffort);
+  }
+});
+
+test("review uses the default review model and passes model and effort through the thread config", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const defaults = run("node", [SCRIPT, "review"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(defaults.status, 0, defaults.stderr);
+  let thread = readFakeState(binDir).lastThreadStart;
+  assert.equal(thread.model, "gpt-6-astra");
+  assert.deepEqual(thread.config, { review_model: "gpt-6-astra", model_reasoning_effort: "xhigh" });
+  assert.equal(thread.sandbox, "read-only");
+  assert.match(thread.developerInstructions, /This run is read-only/);
+  assert.match(thread.developerInstructions, /do not create or switch branches/);
+
+  const custom = run("node", [SCRIPT, "review", "--model", "sol", "--effort", "high"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(custom.status, 0, custom.stderr);
+  assert.match(custom.stdout, /No material issues found/);
+  thread = readFakeState(binDir).lastThreadStart;
+  assert.equal(thread.model, "gpt-6.1-sol");
+  assert.deepEqual(thread.config, { review_model: "gpt-6.1-sol", model_reasoning_effort: "high" });
+
+  const inline = run("node", [SCRIPT, "review", "--effort=max", "--model=luna"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(inline.status, 0, inline.stderr);
+  thread = readFakeState(binDir).lastThreadStart;
+  assert.equal(thread.model, "gpt-6-luna");
+  assert.deepEqual(thread.config, { review_model: "gpt-6-luna", model_reasoning_effort: "max" });
+});
+
+test("adversarial review uses the default review model and effort", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "adversarial-review"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-astra");
+  assert.equal(fakeState.lastTurnStart.effort, "xhigh");
+});
+
+test("adversarial review treats --effort as a flag, not focus text", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "adversarial-review", "--effort", "high", "focus on retries"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-astra");
+  assert.equal(fakeState.lastTurnStart.effort, "high");
+  assert.match(fakeState.lastTurnStart.prompt, /User focus: focus on retries/);
+  assert.doesNotMatch(fakeState.lastTurnStart.prompt, /--effort/);
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
