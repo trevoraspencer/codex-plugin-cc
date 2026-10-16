@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import os from "node:os";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -102,12 +103,26 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
-    cwd,
-    env: childEnv,
-    encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
-  });
+  const promptFile = path.join(os.tmpdir(), `codex-stop-review-${process.pid}-${Date.now()}.txt`);
+  fs.writeFileSync(promptFile, prompt, { encoding: "utf8", mode: 0o600 });
+  let result;
+  try {
+    result = spawnSync(process.execPath, [scriptPath, "task", "--json", "--prompt-file", promptFile], {
+      cwd,
+      env: childEnv,
+      encoding: "utf8",
+      timeout: STOP_REVIEW_TIMEOUT_MS,
+      maxBuffer: 8 * 1024 * 1024
+    });
+  } finally {
+    try {
+      fs.unlinkSync(promptFile);
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
 
   if (result.error?.code === "ETIMEDOUT") {
     return {
