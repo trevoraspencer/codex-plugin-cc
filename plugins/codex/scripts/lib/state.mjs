@@ -9,11 +9,75 @@ const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const LOCK_WAIT_MS = 10_000;
+const STALE_LOCK_MS = 30_000;
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withStateLock(cwd, fn) {
+  const stateDir = resolveStateDir(cwd);
+  fs.mkdirSync(stateDir, { recursive: true });
+  const lockFile = path.join(stateDir, LOCK_FILE_NAME);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let fd;
+
+  while (!fd) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      let stale = false;
+      try {
+        stale = Date.now() - fs.statSync(lockFile).mtimeMs > STALE_LOCK_MS;
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") {
+          throw statError;
+        }
+      }
+      if (stale) {
+        try {
+          fs.unlinkSync(lockFile);
+        } catch (unlinkError) {
+          if (unlinkError?.code !== "ENOENT") {
+            throw unlinkError;
+          }
+        }
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error("Timed out waiting to update Codex job state. Retry the command.");
+      }
+      sleepMs(20);
+    }
+  }
+
+  const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+  try {
+    fs.writeFileSync(fd, `${token}\n`);
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    try {
+      if (fs.readFileSync(lockFile, "utf8").trim() === token) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
 }
 
 function defaultState() {
@@ -57,24 +121,41 @@ export function ensureStateDir(cwd) {
 
 export function loadState(cwd) {
   const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
+  let raw;
+  try {
+    raw = fs.readFileSync(stateFile, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return defaultState();
+    }
+    throw new Error(`Codex job state is unreadable (${stateFile}). It was left unchanged. ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  let parsed;
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch {
-    return defaultState();
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`Codex job state is unreadable (${stateFile}). It was left unchanged. ${error instanceof Error ? error.message : String(error)}`);
   }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Codex job state is unreadable (${stateFile}). It was left unchanged. Expected an object.`);
+  }
+  if (parsed.jobs !== undefined && !Array.isArray(parsed.jobs)) {
+    throw new Error(`Codex job state is unreadable (${stateFile}). It was left unchanged. Expected jobs to be an array.`);
+  }
+  if (parsed.config !== undefined && parsed.config !== null && (typeof parsed.config !== "object" || Array.isArray(parsed.config))) {
+    throw new Error(`Codex job state is unreadable (${stateFile}). It was left unchanged. Expected config to be an object.`);
+  }
+
+  return {
+    ...defaultState(),
+    ...parsed,
+    config: {
+      ...defaultState().config,
+      ...(parsed.config ?? {})
+    },
+    jobs: parsed.jobs ?? []
+  };
 }
 
 function isActiveJob(job) {
@@ -98,9 +179,35 @@ function removeFileIfExists(filePath) {
   }
 }
 
-export function saveState(cwd, state) {
+function removeAbandonedStateTemps(cwd) {
+  const stateDir = resolveStateDir(cwd);
+  for (const entry of fs.readdirSync(stateDir)) {
+    if (entry.startsWith(`${STATE_FILE_NAME}.`) && entry.endsWith(".tmp")) {
+      fs.unlinkSync(path.join(stateDir, entry));
+    }
+  }
+}
+
+function writeStateFile(cwd, nextState) {
+  const stateFile = resolveStateFile(cwd);
+  const tempFile = path.join(resolveStateDir(cwd), `${STATE_FILE_NAME}.${process.pid}.${Date.now()}.tmp`);
+  fs.writeFileSync(tempFile, `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  try {
+    fs.renameSync(tempFile, stateFile);
+  } catch (error) {
+    if (error?.code !== "EEXIST" && error?.code !== "EPERM") {
+      fs.unlinkSync(tempFile);
+      throw error;
+    }
+    fs.unlinkSync(stateFile);
+    fs.renameSync(tempFile, stateFile);
+  }
+}
+
+function saveStateUnlocked(cwd, state) {
   const previousJobs = loadState(cwd).jobs;
   ensureStateDir(cwd);
+  removeAbandonedStateTemps(cwd);
   const nextJobs = pruneJobs(state.jobs ?? []);
   const nextState = {
     version: STATE_VERSION,
@@ -120,14 +227,20 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeStateFile(cwd, nextState);
   return nextState;
 }
 
+export function saveState(cwd, state) {
+  return withStateLock(cwd, () => saveStateUnlocked(cwd, state));
+}
+
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveStateUnlocked(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
