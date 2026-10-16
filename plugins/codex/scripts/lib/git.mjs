@@ -194,8 +194,34 @@ function formatSection(title, body) {
   return [`## ${title}`, "", body.trim() ? body.trim() : "(none)", ""].join("\n");
 }
 
+function isInsideDirectory(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
 function formatUntrackedFile(cwd, relativePath) {
   const absolutePath = path.join(cwd, relativePath);
+  let linkStat;
+  try {
+    linkStat = fs.lstatSync(absolutePath);
+  } catch {
+    return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+  }
+
+  if (linkStat.isSymbolicLink()) {
+    let resolved;
+    let repoRoot;
+    try {
+      resolved = fs.realpathSync(absolutePath);
+      repoRoot = fs.realpathSync(cwd);
+    } catch {
+      return `### ${relativePath}\n(skipped: broken symlink or unreadable file)`;
+    }
+    if (!isInsideDirectory(repoRoot, resolved)) {
+      return `### ${relativePath}\n(skipped: symlink points outside the repository)`;
+    }
+  }
+
   let stat;
   try {
     stat = fs.statSync(absolutePath);
