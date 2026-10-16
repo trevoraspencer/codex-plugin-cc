@@ -77,10 +77,19 @@ export function loadState(cwd) {
   }
 }
 
+function isActiveJob(job) {
+  return job?.status === "queued" || job?.status === "running";
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+  const active = sorted.filter((job) => isActiveJob(job));
+  const finished = sorted.filter((job) => !isActiveJob(job));
+  const keptIds = new Set([
+    ...active.map((job) => job.id),
+    ...finished.slice(0, Math.max(0, MAX_JOBS - active.length)).map((job) => job.id)
+  ]);
+  return sorted.filter((job) => keptIds.has(job.id));
 }
 
 function removeFileIfExists(filePath) {
