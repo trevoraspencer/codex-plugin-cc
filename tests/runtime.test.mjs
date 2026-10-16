@@ -1188,6 +1188,10 @@ test("task --background enqueues a detached worker and exposes per-job status", 
   const launchPayload = JSON.parse(launched.stdout);
   assert.equal(launchPayload.status, "queued");
   assert.match(launchPayload.jobId, /^task-/);
+  const storedAtLaunch = JSON.parse(
+    fs.readFileSync(path.join(resolveStateDir(repo), "jobs", `${launchPayload.jobId}.json`), "utf8")
+  );
+  assert.equal(storedAtLaunch.request.prompt, "investigate the failing test");
 
   const waitedStatus = run(
     "node",
