@@ -384,6 +384,7 @@ test("adversarial review renders structured findings over app-server turn/start"
 
   assert.equal(result.status, 0);
   assert.match(result.stdout, /Missing empty-state guard/);
+  assert.match(result.stdout, /Confidence: 0\.87/);
 });
 
 test("adversarial review accepts the same base-branch targeting as review", () => {

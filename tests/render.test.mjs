@@ -3,6 +3,48 @@ import assert from "node:assert/strict";
 
 import { renderReviewResult, renderStoredJobResult } from "../plugins/codex/scripts/lib/render.mjs";
 
+test("renderReviewResult shows a finding confidence and drops a value outside 0 to 1", () => {
+  const output = renderReviewResult(
+    {
+      parsed: {
+        verdict: "needs-attention",
+        summary: "Ship risk.",
+        findings: [
+          {
+            severity: "high",
+            title: "Lost update",
+            body: "Two writers drop a job.",
+            file: "state.mjs",
+            line_start: 12,
+            line_end: 18,
+            confidence: 0.91,
+            recommendation: "Lock the state file."
+          },
+          {
+            severity: "low",
+            title: "Unscored note",
+            body: "No score was provided.",
+            file: "notes.md",
+            line_start: 1,
+            line_end: 1,
+            confidence: 2,
+            recommendation: ""
+          }
+        ],
+        next_steps: []
+      },
+      rawOutput: "{}",
+      parseError: null
+    },
+    { reviewLabel: "Adversarial Review", targetLabel: "working tree diff" }
+  );
+
+  assert.match(output, /Confidence: 0\.91/);
+  assert.match(output, /state\.mjs:12-18/);
+  assert.doesNotMatch(output, /Confidence: 2/);
+  assert.match(output, /Unscored note/);
+});
+
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
     {
