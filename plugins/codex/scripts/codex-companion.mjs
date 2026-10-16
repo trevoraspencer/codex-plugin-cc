@@ -49,6 +49,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  markJobCancelled,
   nowIso,
   runTrackedJob,
   SESSION_ID_ENV
@@ -1038,38 +1039,21 @@ async function handleCancel(argv) {
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
-
+  const marked = markJobCancelled(workspaceRoot, { ...existing, ...job }, completedAt);
   const payload = {
     jobId: job.id,
-    status: "cancelled",
+    status: marked.job.status ?? "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
     turnInterrupted: interrupt.interrupted
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  if (!marked.applied) {
+    outputCommandResult(payload, `Job ${job.id} is already ${marked.job.status}.\n`, options.json);
+    return;
+  }
+
+  outputCommandResult(payload, renderCancelReport(marked.job), options.json);
 }
 
 async function main() {
