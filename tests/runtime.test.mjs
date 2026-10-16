@@ -2198,6 +2198,48 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
 
+test("killing a background task interrupts its Codex turn on the shared broker", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (job?.status === "running" && job.threadId && job.turnId && job.pid) {
+      return job;
+    }
+    return null;
+  }, { timeoutMs: 15000 });
+
+  process.kill(runningJob.pid, "SIGKILL");
+
+  await waitFor(() => {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return fakeState.lastInterrupt ?? null;
+  }, { timeoutMs: 5000 });
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastInterrupt, {
+    threadId: runningJob.threadId,
+    turnId: runningJob.turnId
+  });
+});
+
 test("session end fully cleans up jobs for the ending session", async (t) => {
   const repo = makeTempDir();
   initGitRepo(repo);
