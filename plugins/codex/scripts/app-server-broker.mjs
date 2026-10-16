@@ -73,6 +73,7 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamTurns = null;
+  let drainingTurns = null;
   const sockets = new Set();
 
   function clearSocketOwnership(socket) {
@@ -86,11 +87,26 @@ async function main() {
   }
 
   function interruptTurns(turns) {
-    for (const turn of turns ?? []) {
-      if (!turn.threadId || !turn.turnId) {
-        continue;
-      }
-      appClient.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }).catch(() => {});
+    const pending = (turns ?? []).filter((turn) => turn.threadId && turn.turnId);
+    if (pending.length === 0) {
+      return;
+    }
+    drainingTurns = pending;
+    for (const turn of pending) {
+      appClient.request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }).catch(() => {
+        if (drainingTurns === pending) {
+          drainingTurns = null;
+        }
+      });
+    }
+  }
+
+  function finishDrainingTurn(threadId) {
+    if (!drainingTurns?.length) {
+      return;
+    }
+    if (!threadId || drainingTurns.some((turn) => turn.threadId === threadId)) {
+      drainingTurns = null;
     }
   }
 
@@ -102,6 +118,9 @@ async function main() {
   }
 
   function routeNotification(message) {
+    if (message.method === "turn/completed") {
+      finishDrainingTurn(message.params?.threadId ?? null);
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -188,10 +207,12 @@ async function main() {
         }
 
         const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket && !drainingTurns;
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
+          (drainingTurns?.length ||
+            (activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStreamSocket && activeStreamSocket !== socket)) &&
           !allowInterruptDuringActiveStream
         ) {
           send(socket, {
