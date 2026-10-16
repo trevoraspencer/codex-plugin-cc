@@ -81,6 +81,9 @@ export function ensureGitRepository(cwd) {
   if (errorCode === "ENOENT") {
     throw new Error("git is not installed. Install Git and retry.");
   }
+  if (result.signal) {
+    throw new Error(formatCommandFailure(result));
+  }
   if (result.status !== 0) {
     throw new Error("This command must run inside a Git repository.");
   }

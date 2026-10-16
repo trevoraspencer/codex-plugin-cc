@@ -1,7 +1,22 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+import { runCommand, runCommandChecked, terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
+
+test("runCommand reports a signal-killed process as a failure", () => {
+  const killed = runCommand(process.execPath, ["-e", "process.kill(process.pid, 'SIGKILL')"]);
+  assert.equal(killed.signal, "SIGKILL");
+  assert.equal(killed.status, 1);
+
+  assert.throws(
+    () => runCommandChecked(process.execPath, ["-e", "process.kill(process.pid, 'SIGKILL')"]),
+    /signal=SIGKILL/
+  );
+
+  const ok = runCommand(process.execPath, ["-e", "process.exit(0)"]);
+  assert.equal(ok.status, 0);
+  assert.equal(ok.signal, null);
+});
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
