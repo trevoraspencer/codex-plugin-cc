@@ -764,6 +764,18 @@ test("task --fresh is treated as routing control and does not leak into the prom
   assert.equal(fakeState.lastTurnStart.prompt, "diagnose the flaky test");
 });
 
+test("task splits one slash-command string without dropping apostrophes or later flags", () => {
+  const binDir = makeTempDir();
+  const repo = setupCommittedRepo(binDir);
+
+  const result = run("node", [SCRIPT, "task", "fix the user's bug --model luna"], { cwd: repo, env: buildEnv(binDir) });
+
+  assert.equal(result.status, 0, result.stderr);
+  const fakeState = readFakeState(binDir);
+  assert.equal(fakeState.lastTurnStart.model, "gpt-6-luna");
+  assert.equal(fakeState.lastTurnStart.prompt, "fix the user's bug");
+});
+
 test("task forwards model selection and reasoning effort to app-server turn/start", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
