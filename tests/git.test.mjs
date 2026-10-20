@@ -148,6 +148,31 @@ test("collectReviewContext skips broken untracked symlinks instead of crashing",
   assert.match(context.content, /skipped: broken symlink or unreadable file/i);
 });
 
+test("collectReviewContext does not inline an untracked symlink to a file outside the repository", () => {
+  const cwd = makeTempDir();
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
+  run("git", ["add", "app.js"], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const outside = path.join(path.dirname(cwd), "secret.txt");
+  fs.writeFileSync(outside, "SECRET_TOKEN_OUTSIDE_REPO\n");
+  fs.symlinkSync(outside, path.join(cwd, "leak.txt"));
+
+  fs.writeFileSync(path.join(cwd, "tracked.js"), "export const marker = 'TRACKED_SYMLINK_TARGET';\n");
+  run("git", ["add", "tracked.js"], { cwd });
+  run("git", ["commit", "-m", "track target"], { cwd });
+  fs.symlinkSync(path.join(cwd, "tracked.js"), path.join(cwd, "inside-link.txt"));
+
+  const target = resolveReviewTarget(cwd, { scope: "working-tree" });
+  const context = collectReviewContext(cwd, target);
+
+  assert.equal(context.content.includes("SECRET_TOKEN_OUTSIDE_REPO"), false);
+  assert.match(context.content, /### leak\.txt\n\(skipped: symlink points outside the repository\)/);
+  assert.match(context.content, /### inside-link\.txt/);
+  assert.match(context.content, /TRACKED_SYMLINK_TARGET/);
+});
+
 test("collectReviewContext falls back to lightweight context for larger adversarial reviews", () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
