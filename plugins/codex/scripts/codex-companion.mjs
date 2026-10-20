@@ -685,17 +685,27 @@ function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
   upsertJob(job.workspaceRoot, queuedRecord);
+
+  const child = spawnDetachedTaskWorker(cwd, job.id);
+  const current = readStoredJob(job.workspaceRoot, job.id) ?? queuedRecord;
+  if (current.status === "queued") {
+    const withPid = {
+      ...current,
+      pid: child.pid ?? null
+    };
+    writeJobFile(job.workspaceRoot, job.id, withPid);
+    upsertJob(job.workspaceRoot, withPid);
+  }
 
   return {
     payload: {
@@ -856,6 +866,16 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+async function waitForStoredTask(workspaceRoot, jobId) {
+  const deadline = Date.now() + 1000;
+  let stored = readStoredJob(workspaceRoot, jobId);
+  while ((!stored || !stored.request) && Date.now() < deadline) {
+    await sleep(20);
+    stored = readStoredJob(workspaceRoot, jobId);
+  }
+  return stored;
+}
+
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
@@ -867,7 +887,7 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
+  const storedJob = await waitForStoredTask(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
   }
