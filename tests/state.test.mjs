@@ -3,9 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
-import { loadState, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState, upsertJob } from "../plugins/codex/scripts/lib/state.mjs";
+
+const STATE_MODULE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../plugins/codex/scripts/lib/state.mjs");
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -159,4 +163,66 @@ test("saveState keeps every running job when active jobs exceed the cap", () => 
     loadState(workspace).jobs.map((job) => job.id),
     Array.from({ length: 51 }, (_, index) => `run-${50 - index}`)
   );
+});
+
+test("concurrent job updates all remain in the state file", async () => {
+  const workspace = makeTempDir();
+  const workerPath = path.join(workspace, "worker.mjs");
+  fs.writeFileSync(
+    workerPath,
+    [
+      `import { upsertJob } from ${JSON.stringify(STATE_MODULE)};`,
+      "const id = process.argv[2];",
+      "const workspace = process.argv[3];",
+      "for (let attempt = 0; attempt < 15; attempt += 1) {",
+      "  upsertJob(workspace, { id, status: 'completed', summary: id });",
+      "}",
+      ""
+    ].join("\n")
+  );
+
+  const ids = ["job-a", "job-b", "job-c", "job-d", "job-e", "job-f", "job-g", "job-h"];
+  const exits = await Promise.all(
+    ids.map(
+      (id) =>
+        new Promise((resolve) => {
+          const child = spawn(process.execPath, [workerPath, id, workspace], { stdio: "inherit" });
+          child.on("exit", (code) => resolve(code));
+        })
+    )
+  );
+
+  assert.deepEqual(exits, [0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(
+    loadState(workspace).jobs.map((job) => job.id).sort(),
+    ["job-a", "job-b", "job-c", "job-d", "job-e", "job-f", "job-g", "job-h"]
+  );
+});
+
+test("a corrupt state file is left unchanged", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+  const original = "{ not json";
+  fs.writeFileSync(stateFile, original);
+
+  assert.throws(
+    () => upsertJob(workspace, { id: "job-new", status: "completed" }),
+    /Codex job state is unreadable/
+  );
+  assert.equal(fs.readFileSync(stateFile, "utf8"), original);
+});
+
+test("a stale state lock does not block the next update", () => {
+  const workspace = makeTempDir();
+  const lockFile = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  fs.writeFileSync(lockFile, "999999\n");
+  const stale = new Date(Date.now() - 60_000);
+  fs.utimesSync(lockFile, stale, stale);
+
+  upsertJob(workspace, { id: "job-after-stale-lock", status: "completed" });
+
+  assert.equal(loadState(workspace).jobs.map((job) => job.id).join(","), "job-after-stale-lock");
+  assert.equal(fs.existsSync(lockFile), false);
 });
