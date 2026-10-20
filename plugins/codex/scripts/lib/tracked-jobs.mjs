@@ -1,12 +1,76 @@
 import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { ensureStateDir, readJobFile, resolveJobFile, resolveJobLogFile, resolveJobsDir, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const LOCK_WAIT_MS = 10_000;
+const STALE_LOCK_MS = 30_000;
+const TERMINAL_JOB_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
 export function nowIso() {
   return new Date().toISOString();
+}
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function withJobLock(workspaceRoot, jobId, fn) {
+  ensureStateDir(workspaceRoot);
+  const lockFile = path.join(resolveJobsDir(workspaceRoot), `${jobId}.lock`);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let fd;
+
+  while (!fd) {
+    try {
+      fd = fs.openSync(lockFile, "wx");
+    } catch (error) {
+      if (error?.code !== "EEXIST") {
+        throw error;
+      }
+      let stale = false;
+      try {
+        stale = Date.now() - fs.statSync(lockFile).mtimeMs > STALE_LOCK_MS;
+      } catch (statError) {
+        if (statError?.code !== "ENOENT") {
+          throw statError;
+        }
+      }
+      if (stale) {
+        try {
+          fs.unlinkSync(lockFile);
+        } catch (unlinkError) {
+          if (unlinkError?.code !== "ENOENT") {
+            throw unlinkError;
+          }
+        }
+        continue;
+      }
+      if (Date.now() > deadline) {
+        throw new Error(`Timed out waiting to update job ${jobId}. Retry the command.`);
+      }
+      sleepMs(20);
+    }
+  }
+
+  const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+  try {
+    fs.writeFileSync(fd, `${token}\n`);
+    return fn();
+  } finally {
+    fs.closeSync(fd);
+    try {
+      if (fs.readFileSync(lockFile, "utf8").trim() === token) {
+        fs.unlinkSync(lockFile);
+      }
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
 }
 
 function normalizeProgressEvent(value) {
@@ -99,17 +163,20 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    withJobLock(workspaceRoot, jobId, () => {
+      const storedJob = readStoredJobOrNull(workspaceRoot, jobId);
+      if (storedJob && TERMINAL_JOB_STATUSES.has(storedJob.status)) {
+        return;
+      }
 
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
+      upsertJob(workspaceRoot, patch);
+      if (!storedJob) {
+        return;
+      }
+      writeJobFile(workspaceRoot, jobId, {
+        ...storedJob,
+        ...patch
+      });
     });
   };
 }
@@ -139,65 +206,136 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+function storeJobUpdate(workspaceRoot, jobId, record, indexPatch) {
+  writeJobFile(workspaceRoot, jobId, record);
+  upsertJob(workspaceRoot, indexPatch);
+}
+
+export function markJobCancelled(workspaceRoot, job, completedAt = nowIso()) {
+  return withJobLock(workspaceRoot, job.id, () => {
+    const existing = readStoredJobOrNull(workspaceRoot, job.id) ?? {};
+    if (TERMINAL_JOB_STATUSES.has(existing.status)) {
+      return { job: existing, applied: false };
+    }
+
+    const nextJob = {
+      ...existing,
+      ...job,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      completedAt,
+      cancelledAt: completedAt,
+      errorMessage: "Cancelled by user."
+    };
+    storeJobUpdate(workspaceRoot, job.id, nextJob, {
+      id: job.id,
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      errorMessage: "Cancelled by user.",
+      completedAt
+    });
+    return { job: nextJob, applied: true };
+  });
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
-    ...job,
-    status: "running",
-    startedAt: nowIso(),
-    phase: "starting",
-    pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  const started = withJobLock(job.workspaceRoot, job.id, () => {
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id);
+    if (existing?.status === "cancelled") {
+      return { cancelled: true, runningRecord: existing };
+    }
+
+    const runningRecord = {
+      ...(existing ?? {}),
+      ...job,
+      status: "running",
+      startedAt: existing?.startedAt ?? nowIso(),
+      phase: "starting",
+      pid: process.pid,
+      logFile: options.logFile ?? job.logFile ?? existing?.logFile ?? null
+    };
+    storeJobUpdate(job.workspaceRoot, job.id, runningRecord, runningRecord);
+    return { cancelled: false, runningRecord };
+  });
+
+  if (started.cancelled) {
+    return {
+      exitStatus: 1,
+      threadId: started.runningRecord.threadId ?? null,
+      turnId: started.runningRecord.turnId ?? null,
+      payload: null,
+      rendered: "",
+      summary: "Cancelled by user."
+    };
+  }
+
+  const runningRecord = started.runningRecord;
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
+    const preservedCancel = withJobLock(job.workspaceRoot, job.id, () => {
+      const existing = readStoredJobOrNull(job.workspaceRoot, job.id);
+      if (existing?.status === "cancelled") {
+        return true;
+      }
+
+      const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+      const completedAt = nowIso();
+      const finished = {
+        ...runningRecord,
+        status: completionStatus,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        pid: null,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        completedAt,
+        result: execution.payload,
+        rendered: execution.rendered
+      };
+      storeJobUpdate(job.workspaceRoot, job.id, finished, {
+        id: job.id,
+        status: completionStatus,
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        summary: execution.summary,
+        phase: completionStatus === "completed" ? "done" : "failed",
+        pid: null,
+        completedAt
+      });
+      return false;
     });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    if (!preservedCancel) {
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
+    }
     return execution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
+    withJobLock(job.workspaceRoot, job.id, () => {
+      const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+      if (existing.status === "cancelled") {
+        return;
+      }
+
+      const completedAt = nowIso();
+      const failed = {
+        ...existing,
+        status: "failed",
+        phase: "failed",
+        errorMessage,
+        pid: null,
+        completedAt,
+        logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
+      };
+      storeJobUpdate(job.workspaceRoot, job.id, failed, {
+        id: job.id,
+        status: "failed",
+        phase: "failed",
+        pid: null,
+        errorMessage,
+        completedAt
+      });
     });
     throw error;
   }
