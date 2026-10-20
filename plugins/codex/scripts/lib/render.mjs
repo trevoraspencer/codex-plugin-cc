@@ -55,6 +55,7 @@ function normalizeReviewFinding(finding, index) {
     file: typeof source.file === "string" && source.file.trim() ? source.file.trim() : "unknown",
     line_start: lineStart,
     line_end: lineEnd,
+    confidence: typeof source.confidence === "number" && source.confidence >= 0 && source.confidence <= 1 ? source.confidence : null,
     recommendation: typeof source.recommendation === "string" ? source.recommendation.trim() : ""
   };
 }
@@ -267,6 +268,9 @@ export function renderReviewResult(parsedResult, meta) {
       const lineSuffix = formatLineRange(finding);
       lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}${lineSuffix})`);
       lines.push(`  ${finding.body}`);
+      if (typeof finding.confidence === "number") {
+        lines.push(`  Confidence: ${finding.confidence}`);
+      }
       if (finding.recommendation) {
         lines.push(`  Recommendation: ${finding.recommendation}`);
       }
