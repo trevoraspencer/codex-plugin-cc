@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import { loadState, resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -101,5 +101,62 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
     Array.from({ length: 50 }, (_, index) => `job-${index + 1}`)
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
+  );
+});
+
+test("saveState keeps a running job when finished history exceeds the cap", () => {
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  const jobs = Array.from({ length: 51 }, (_, index) => {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    const jobFile = resolveJobFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: index === 0 ? "running" : "completed" }, null, 2), "utf8");
+    return {
+      id: jobId,
+      status: index === 0 ? "running" : "completed",
+      logFile,
+      updatedAt,
+      createdAt: updatedAt
+    };
+  });
+
+  fs.writeFileSync(
+    stateFile,
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs }, null, 2)}\n`,
+    "utf8"
+  );
+
+  saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs });
+
+  const savedIds = loadState(workspace).jobs.map((job) => job.id);
+  assert.equal(savedIds.includes("job-0"), true);
+  assert.equal(savedIds.includes("job-1"), false);
+  assert.equal(savedIds.length, 50);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-0")), true);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-0")), true);
+  assert.equal(fs.existsSync(resolveJobFile(workspace, "job-1")), false);
+  assert.equal(fs.existsSync(resolveJobLogFile(workspace, "job-1")), false);
+  assert.equal(loadState(workspace).jobs.find((job) => job.id === "job-0").status, "running");
+});
+
+test("saveState keeps every running job when active jobs exceed the cap", () => {
+  const workspace = makeTempDir();
+  const jobs = Array.from({ length: 51 }, (_, index) => ({
+    id: `run-${index}`,
+    status: "running",
+    updatedAt: new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString(),
+    createdAt: new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString()
+  }));
+
+  saveState(workspace, { version: 1, config: { stopReviewGate: false }, jobs });
+
+  assert.deepEqual(
+    loadState(workspace).jobs.map((job) => job.id),
+    Array.from({ length: 51 }, (_, index) => `run-${50 - index}`)
   );
 });
