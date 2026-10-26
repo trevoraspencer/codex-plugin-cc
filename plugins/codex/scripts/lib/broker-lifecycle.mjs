@@ -6,10 +6,12 @@ import process from "node:process";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { createBrokerEndpoint, parseBrokerEndpoint } from "./broker-endpoint.mjs";
-import { resolveStateDir } from "./state.mjs";
+import { resolveStateDir, resolveStateRoot } from "./state.mjs";
 
 export const PID_FILE_ENV = "CODEX_COMPANION_APP_SERVER_PID_FILE";
 export const LOG_FILE_ENV = "CODEX_COMPANION_APP_SERVER_LOG_FILE";
+// Same variable as SESSION_ID_ENV in session-lifecycle-hook.mjs. Defined here to avoid an import cycle.
+const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
 const BROKER_STATE_FILE = "broker.json";
 
 export function createBrokerSessionDir(prefix = "cxc-") {
@@ -93,10 +95,43 @@ export function saveBrokerSession(cwd, session) {
 }
 
 export function clearBrokerSession(cwd) {
-  const stateFile = resolveBrokerStateFile(cwd);
+  clearBrokerSessionFile(resolveBrokerStateFile(cwd));
+}
+
+export function clearBrokerSessionFile(stateFile) {
   if (fs.existsSync(stateFile)) {
     fs.unlinkSync(stateFile);
   }
+}
+
+// The broker is recorded under the directory the companion ran in, which can differ from the
+// directory the session ends in. Matching on the session ID finds it either way.
+export function listBrokerSessionsForSession(sessionId) {
+  if (!sessionId) {
+    return [];
+  }
+
+  const stateRoot = resolveStateRoot();
+  if (!fs.existsSync(stateRoot)) {
+    return [];
+  }
+
+  const matches = [];
+  for (const entry of fs.readdirSync(stateRoot)) {
+    const stateFile = path.join(stateRoot, entry, BROKER_STATE_FILE);
+    if (!fs.existsSync(stateFile)) {
+      continue;
+    }
+    try {
+      const record = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      if (record?.sessionId === sessionId) {
+        matches.push({ record, stateFile });
+      }
+    } catch {
+      // Ignore unreadable broker records; they are not tied to this session.
+    }
+  }
+  return matches;
 }
 
 async function isBrokerEndpointReady(endpoint) {
@@ -164,7 +199,8 @@ export async function ensureBrokerSession(cwd, options = {}) {
     pidFile,
     logFile,
     sessionDir,
-    pid: child.pid ?? null
+    pid: child.pid ?? null,
+    sessionId: options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null
   };
   saveBrokerSession(cwd, session);
   return session;
