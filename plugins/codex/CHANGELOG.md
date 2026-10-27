@@ -4,6 +4,7 @@
 
 First release of this fork of [openai/codex-plugin-cc](https://github.com/openai/codex-plugin-cc).
 
+- Fixed a shared Codex broker being left running after a session ended. `SessionEnd` now also tears down brokers recorded for that session, so it works when the session ends in a different directory from the one the companion started in.
 - Published through the `trevoraspencer` marketplace, with updated plugin metadata.
 - Updated model handling for the current Codex models:
   - Added the model aliases `sol` (`gpt-6.1-sol`), `astra` (`gpt-6-astra`), and `luna` (`gpt-6-luna`).

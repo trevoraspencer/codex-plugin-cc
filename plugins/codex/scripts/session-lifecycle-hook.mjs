@@ -7,6 +7,8 @@ import { terminateProcessTree } from "./lib/process.mjs";
 import { BROKER_ENDPOINT_ENV } from "./lib/app-server.mjs";
 import {
   clearBrokerSession,
+  clearBrokerSessionFile,
+  listBrokerSessionsForSession,
   LOG_FILE_ENV,
   loadBrokerSession,
   PID_FILE_ENV,
@@ -80,9 +82,11 @@ function handleSessionStart(input) {
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
 
-async function handleSessionEnd(input) {
-  const cwd = input.cwd || process.cwd();
-  const brokerSession =
+// Brokers to tear down: the one recorded for this directory, plus any recorded for this session
+// (the session may end in a different directory from the one the companion started in).
+function collectBrokerSessions(cwd, sessionId) {
+  const brokerSessions = new Map();
+  const cwdSession =
     loadBrokerSession(cwd) ??
     (process.env[BROKER_ENDPOINT_ENV]
       ? {
@@ -91,26 +95,45 @@ async function handleSessionEnd(input) {
           logFile: process.env[LOG_FILE_ENV] ?? null
         }
       : null);
-  const brokerEndpoint = brokerSession?.endpoint ?? null;
-  const pidFile = brokerSession?.pidFile ?? null;
-  const logFile = brokerSession?.logFile ?? null;
-  const sessionDir = brokerSession?.sessionDir ?? null;
-  const pid = brokerSession?.pid ?? null;
-
-  if (brokerEndpoint) {
-    await sendBrokerShutdown(brokerEndpoint);
+  if (cwdSession?.endpoint) {
+    brokerSessions.set(cwdSession.endpoint, { record: cwdSession, stateFile: null });
   }
+  for (const match of listBrokerSessionsForSession(sessionId)) {
+    if (match.record.endpoint && !brokerSessions.has(match.record.endpoint)) {
+      brokerSessions.set(match.record.endpoint, match);
+    }
+  }
+  return [...brokerSessions.values()];
+}
 
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
-  teardownBrokerSession({
-    endpoint: brokerEndpoint,
-    pidFile,
-    logFile,
-    sessionDir,
-    pid,
-    killProcess: terminateProcessTree
-  });
-  clearBrokerSession(cwd);
+async function handleSessionEnd(input) {
+  const cwd = input.cwd || process.cwd();
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  const brokerSessions = collectBrokerSessions(cwd, sessionId);
+
+  // Teardown runs in finally so a failure in job cleanup (for example a state lock timeout)
+  // cannot leave a broker running.
+  try {
+    for (const { record } of brokerSessions) {
+      await sendBrokerShutdown(record.endpoint);
+    }
+    cleanupSessionJobs(cwd, sessionId);
+  } finally {
+    for (const { record, stateFile } of brokerSessions) {
+      teardownBrokerSession({
+        endpoint: record.endpoint ?? null,
+        pidFile: record.pidFile ?? null,
+        logFile: record.logFile ?? null,
+        sessionDir: record.sessionDir ?? null,
+        pid: record.pid ?? null,
+        killProcess: terminateProcessTree
+      });
+      if (stateFile) {
+        clearBrokerSessionFile(stateFile);
+      }
+    }
+    clearBrokerSession(cwd);
+  }
 }
 
 async function main() {
