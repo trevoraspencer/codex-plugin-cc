@@ -73,21 +73,32 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals };
 }
 
+function isEscapable(character, quote) {
+  if (character === "\\" || /\s/.test(character)) {
+    return true;
+  }
+  if (quote) {
+    return character === quote;
+  }
+  return character === "'" || character === "\"";
+}
+
 export function splitRawArgumentString(raw) {
   const tokens = [];
   let current = "";
   let quote = null;
-  let escaping = false;
 
-  for (const character of raw) {
-    if (escaping) {
-      current += character;
-      escaping = false;
-      continue;
-    }
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
 
     if (character === "\\") {
-      escaping = true;
+      const next = raw[index + 1];
+      if (next !== undefined && isEscapable(next, quote)) {
+        current += next;
+        index += 1;
+        continue;
+      }
+      current += character;
       continue;
     }
 
@@ -100,7 +111,7 @@ export function splitRawArgumentString(raw) {
       continue;
     }
 
-    if (character === "'" || character === "\"") {
+    if ((character === "'" || character === "\"") && current.length === 0) {
       quote = character;
       continue;
     }
@@ -114,10 +125,6 @@ export function splitRawArgumentString(raw) {
     }
 
     current += character;
-  }
-
-  if (escaping) {
-    current += "\\";
   }
 
   if (current) {
