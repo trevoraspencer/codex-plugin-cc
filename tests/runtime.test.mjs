@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { parseBrokerEndpoint } from "../plugins/codex/scripts/lib/broker-endpoint.mjs";
 import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -2195,6 +2197,129 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
       hook_event_name: "SessionEnd",
       cwd: repo
     })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+});
+
+test("killing a background task interrupts its Codex turn on the shared broker", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-task");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (job?.status === "running" && job.threadId && job.turnId && job.pid) {
+      return job;
+    }
+    return null;
+  }, { timeoutMs: 15000 });
+
+  process.kill(runningJob.pid, "SIGKILL");
+
+  await waitFor(() => {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return fakeState.lastInterrupt ?? null;
+  }, { timeoutMs: 5000 });
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastInterrupt, {
+    threadId: runningJob.threadId,
+    turnId: runningJob.turnId
+  });
+});
+
+test("a disconnected turn keeps the shared broker busy until that turn ends", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interrupt-holds");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the flaky worker timeout"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    if (job?.status === "running" && job.threadId && job.turnId && job.pid) {
+      return job;
+    }
+    return null;
+  }, { timeoutMs: 15000 });
+
+  process.kill(runningJob.pid, "SIGKILL");
+  await waitFor(() => {
+    const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+    return fakeState.lastInterrupt ?? null;
+  }, { timeoutMs: 5000 });
+
+  const endpoint = loadBrokerSession(repo)?.endpoint;
+  assert.equal(typeof endpoint, "string");
+  const target = parseBrokerEndpoint(endpoint);
+  const busy = await new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: target.path });
+    let buffer = "";
+    const timeout = setTimeout(() => {
+      socket.destroy();
+      reject(new Error("timed out waiting for the broker to reject the new turn"));
+    }, 5000);
+    socket.setEncoding("utf8");
+    socket.on("error", reject);
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newline = buffer.indexOf("\n");
+      while (newline !== -1) {
+        const line = buffer.slice(0, newline);
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+        if (!line.trim()) {
+          continue;
+        }
+        const message = JSON.parse(line);
+        if (message.id === 2) {
+          clearTimeout(timeout);
+          socket.end();
+          resolve(message);
+        }
+      }
+    });
+    socket.on("connect", () => {
+      socket.write(`${JSON.stringify({ id: 1, method: "initialize", params: {} })}\n`);
+      socket.write(`${JSON.stringify({ method: "initialized", params: {} })}\n`);
+      socket.write(`${JSON.stringify({ id: 2, method: "thread/start", params: { cwd: repo } })}\n`);
+    });
+  });
+
+  assert.equal(busy.error.code, -32001);
+  assert.equal(busy.error.message, "Shared Codex broker is busy.");
+
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
   });
   assert.equal(cleanup.status, 0, cleanup.stderr);
 });
