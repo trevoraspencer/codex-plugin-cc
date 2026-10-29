@@ -316,6 +316,10 @@ Each command picks its own model and reasoning effort:
 
 To use your Codex configuration instead of these defaults, for example with a different model provider or a plan without access to these models, set `CODEX_COMPANION_MODEL_DEFAULTS=off` in the environment Claude Code runs in. Flags you pass still apply.
 
+### Shared app server
+
+Commands in a session share one background Codex app server. It stops when the session ends, and also stops on its own after 30 minutes with no command using it, which covers sessions that crash or are force-quit. The next command starts a new one. To change the wait, set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to a number of milliseconds in the environment Claude Code runs in; `0` keeps it running until the session ends.
+
 ### Run rules
 
 Every thread the plugin starts or resumes tells Codex, through developer instructions, that no one can answer questions while it runs, so it should state its assumptions instead of asking. Codex is also told not to create or switch branches, worktrees, commits, stashes, or pull requests. Write-capable runs are told to leave uncommitted changes they did not make intact.
