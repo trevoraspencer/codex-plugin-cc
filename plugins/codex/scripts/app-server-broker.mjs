@@ -8,8 +8,22 @@ import process from "node:process";
 import { parseArgs } from "./lib/args.mjs";
 import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { clearBrokerSession, loadBrokerSession, teardownBrokerSession } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+const IDLE_TIMEOUT_ENV = "CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS";
+const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+
+// SessionEnd does not run when Claude Code crashes or is force-quit, so the broker also exits on
+// its own after this long with no clients and no request in flight. 0 turns this off.
+function resolveIdleTimeoutMs(env = process.env) {
+  const raw = env[IDLE_TIMEOUT_ENV];
+  if (raw === undefined || raw === "") {
+    return DEFAULT_IDLE_TIMEOUT_MS;
+  }
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : DEFAULT_IDLE_TIMEOUT_MS;
+}
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -69,7 +83,34 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let inFlightRequests = 0;
   const sockets = new Set();
+  const idleTimeoutMs = resolveIdleTimeoutMs();
+  let idleTimer = null;
+
+  function stopIdleTimer() {
+    if (idleTimer) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+  }
+
+  function startIdleTimerIfIdle() {
+    stopIdleTimer();
+    if (idleTimeoutMs > 0 && sockets.size === 0 && inFlightRequests === 0) {
+      idleTimer = setTimeout(shutdownIdle, idleTimeoutMs);
+    }
+  }
+
+  async function request(method, params) {
+    inFlightRequests += 1;
+    try {
+      return await appClient.request(method, params);
+    } finally {
+      inFlightRequests -= 1;
+      startIdleTimerIfIdle();
+    }
+  }
 
   function clearSocketOwnership(socket) {
     if (activeRequestSocket === socket) {
@@ -113,9 +154,28 @@ async function main() {
     }
   }
 
+  // Also removes this broker's record, so a later SessionEnd does not signal its pid after the
+  // system has given that pid to another process.
+  async function shutdownIdle() {
+    idleTimer = null;
+    const record = loadBrokerSession(cwd);
+    await shutdown(server);
+    if (record?.endpoint === endpoint) {
+      clearBrokerSession(cwd);
+      teardownBrokerSession({
+        endpoint,
+        pidFile: record.pidFile ?? null,
+        logFile: record.logFile ?? null,
+        sessionDir: record.sessionDir ?? null
+      });
+    }
+    process.exit(0);
+  }
+
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
+    stopIdleTimer();
     sockets.add(socket);
     socket.setEncoding("utf8");
     let buffer = "";
@@ -183,7 +243,7 @@ async function main() {
 
         if (allowInterruptDuringActiveStream) {
           try {
-            const result = await appClient.request(message.method, message.params ?? {});
+            const result = await request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
           } catch (error) {
             send(socket, {
@@ -198,7 +258,7 @@ async function main() {
         activeRequestSocket = socket;
 
         try {
-          const result = await appClient.request(message.method, message.params ?? {});
+          const result = await request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
             activeStreamSocket = socket;
@@ -225,11 +285,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      startIdleTimerIfIdle();
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      startIdleTimerIfIdle();
     });
   });
 
@@ -244,6 +306,7 @@ async function main() {
   });
 
   server.listen(listenTarget.path);
+  startIdleTimerIfIdle();
 }
 
 main().catch((error) => {
