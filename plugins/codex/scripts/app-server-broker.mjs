@@ -25,15 +25,19 @@ function resolveIdleTimeoutMs(env = process.env) {
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_IDLE_TIMEOUT_MS;
 }
 
-function buildStreamThreadIds(method, params, result) {
-  const threadIds = new Set();
+function buildStreamTurns(method, params, result) {
+  const turnId = result?.turn?.id ?? null;
+  if (!turnId) {
+    return [];
+  }
+  const threadIds = [];
   if (params?.threadId) {
-    threadIds.add(params.threadId);
+    threadIds.push(params.threadId);
   }
-  if (method === "review/start" && result?.reviewThreadId) {
-    threadIds.add(result.reviewThreadId);
+  if (method === "review/start" && result?.reviewThreadId && result.reviewThreadId !== params?.threadId) {
+    threadIds.push(result.reviewThreadId);
   }
-  return threadIds;
+  return threadIds.map((threadId) => ({ threadId, turnId }));
 }
 
 function buildJsonRpcError(code, message, data) {
@@ -82,7 +86,8 @@ async function main() {
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
   let activeStreamSocket = null;
-  let activeStreamThreadIds = null;
+  let activeStreamTurns = null;
+  let drainingTurns = null;
   let inFlightRequests = 0;
   const sockets = new Set();
   const idleTimeoutMs = resolveIdleTimeoutMs();
@@ -118,11 +123,45 @@ async function main() {
     }
     if (activeStreamSocket === socket) {
       activeStreamSocket = null;
-      activeStreamThreadIds = null;
+      activeStreamTurns = null;
     }
   }
 
+  function interruptTurns(turns) {
+    const pending = (turns ?? []).filter((turn) => turn.threadId && turn.turnId);
+    if (pending.length === 0) {
+      return;
+    }
+    drainingTurns = pending;
+    for (const turn of pending) {
+      request("turn/interrupt", { threadId: turn.threadId, turnId: turn.turnId }).catch(() => {
+        if (drainingTurns === pending) {
+          drainingTurns = null;
+        }
+      });
+    }
+  }
+
+  function finishDrainingTurn(threadId) {
+    if (!drainingTurns?.length) {
+      return;
+    }
+    if (!threadId || drainingTurns.some((turn) => turn.threadId === threadId)) {
+      drainingTurns = null;
+    }
+  }
+
+  function releaseSocket(socket) {
+    sockets.delete(socket);
+    const turns = activeStreamSocket === socket ? activeStreamTurns : null;
+    clearSocketOwnership(socket);
+    interruptTurns(turns);
+  }
+
   function routeNotification(message) {
+    if (message.method === "turn/completed") {
+      finishDrainingTurn(message.params?.threadId ?? null);
+    }
     const target = activeRequestSocket ?? activeStreamSocket;
     if (!target) {
       return;
@@ -130,9 +169,9 @@ async function main() {
     send(target, message);
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
-      if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
+      if (!threadId || !activeStreamTurns || activeStreamTurns.some((turn) => turn.threadId === threadId)) {
         activeStreamSocket = null;
-        activeStreamThreadIds = null;
+        activeStreamTurns = null;
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -228,10 +267,12 @@ async function main() {
         }
 
         const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket && !drainingTurns;
 
         if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
+          (drainingTurns?.length ||
+            (activeRequestSocket && activeRequestSocket !== socket) ||
+            (activeStreamSocket && activeStreamSocket !== socket)) &&
           !allowInterruptDuringActiveStream
         ) {
           send(socket, {
@@ -261,8 +302,13 @@ async function main() {
           const result = await request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            const turns = buildStreamTurns(message.method, message.params ?? {}, result);
+            if (socket.destroyed) {
+              interruptTurns(turns);
+            } else {
+              activeStreamSocket = socket;
+              activeStreamTurns = turns;
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -277,20 +323,19 @@ async function main() {
           }
           if (activeStreamSocket === socket && !isStreaming) {
             activeStreamSocket = null;
+            activeStreamTurns = null;
           }
         }
       }
     });
 
     socket.on("close", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
+      releaseSocket(socket);
       startIdleTimerIfIdle();
     });
 
     socket.on("error", () => {
-      sockets.delete(socket);
-      clearSocketOwnership(socket);
+      releaseSocket(socket);
       startIdleTimerIfIdle();
     });
   });

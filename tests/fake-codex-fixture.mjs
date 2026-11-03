@@ -598,7 +598,7 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "interrupt-holds") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
@@ -627,6 +627,15 @@ rl.on("line", (line) => {
 	          turnId: message.params.turnId
 	        };
 	        saveState(state);
+	        if (BEHAVIOR === "interrupt-holds") {
+	          const held = interruptibleTurns.get(message.params.turnId);
+	          if (held) {
+	            clearTimeout(held.timer);
+	            interruptibleTurns.delete(message.params.turnId);
+	          }
+	          send({ id: message.id, result: {} });
+	          break;
+	        }
 	        const pending = interruptibleTurns.get(message.params.turnId);
 	        if (pending) {
 	          clearTimeout(pending.timer);
